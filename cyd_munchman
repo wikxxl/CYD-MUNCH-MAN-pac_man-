@@ -1,0 +1,1739 @@
+/*
+ * CYD MUNCH MAN v1.0 (2026)
+ * Classic Munch Man style game for ESP32 CYD (320x240)
+ * 
+ * Board: 28x20 cells (10x10 px each)
+ * 
+ * Map Legend:
+ * 0 = Corridor (empty)
+ * 1 = Wall (blue)
+ * 5 = Dot (1 point)
+ * 6 = Power pellet (10 pts + hunting mode)
+ * 7 = Ghost spawn position
+ * 8 = Fruit bonus (+50 pts)
+ * 9 = Player start
+ */
+
+#include <SPI.h>
+#include <TFT_eSPI.h>
+#include <SD.h>
+
+TFT_eSPI tft = TFT_eSPI();
+
+// ==================== HARDWARE CONFIG ====================
+#define SD_CS          5
+#define BUZZER_PIN     4      // GPIO 4 (free after removing RGB LED)
+#define BUZZER_CHANNEL 0
+
+// ==================== DISPLAY ====================
+#define SCREEN_W       320
+#define SCREEN_H       240
+
+// ==================== GAME BOARD ====================
+// Board: 26x17 cells (12x12 px each) = 312x204 px
+#define MAP_W          26      // Board width in cells
+#define MAP_H          17      // Board height in cells
+#define CELL_SIZE      12      // Cell size in pixels (bigger sprites!)
+#define MAP_OFFSET_X   4       // (320 - 26*12) / 2 = 4
+#define MAP_OFFSET_Y   26      // UI bar on top
+#define UI_HEIGHT      26
+
+// ==================== FILE PATHS ====================
+#define MAP_PATH       "/gry/munchman/"
+#define CONFIG_FILE    "/gry/munchman/config.txt"
+
+// ==================== APP MODES ====================
+enum AppMode { MODE_MENU, MODE_GAME, MODE_EDITOR, MODE_SETUP };
+AppMode currentMode = MODE_MENU;
+
+// ==================== SETTINGS ====================
+struct Settings {
+    bool soundEnabled;      // Sound on/off
+    int soundVolume;        // Volume 0-100%
+    int touchSensitivity;   // 1=low, 2=medium, 3=high (dead zone size)
+    int difficulty;         // 1=easy, 2=normal, 3=hard (ghost speed)
+    int playerSpeed;        // Player speed ms
+} settings = {
+    true,   // sound on
+    70,     // 70% volume
+    2,      // medium sensitivity
+    2,      // normal difficulty
+    100     // default player speed
+};
+
+// ==================== GAME STATE ====================
+bool isPowerMode = false;
+unsigned long powerModeEnd = 0;
+bool gameOver = false;
+bool gameWon = false;
+int currentLevel = 1;              // Current level number
+
+// ==================== STATS ====================
+int score = 0;
+int lives = 3;
+int totalDots = 0;
+int dotsEaten = 0;
+int ghostsEaten = 0;               // Ghosts eaten in current power mode
+
+// UI state tracking (to avoid constant refresh)
+int prevScore = -1;
+int prevLives = -1;
+bool prevPowerMode = false;
+unsigned long prevPowerSec = 999;
+int prevLevel = -1;
+
+// ==================== FRUITS ====================
+// Fruit types: 0=cherry, 1=strawberry, 2=orange, 3=apple, 4=melon
+int fruitType = 0;                 // Current fruit type on map
+bool fruitActive = false;          // Is fruit currently on map
+int fruitX = 0, fruitY = 0;        // Fruit position
+unsigned long fruitSpawnTime = 0;  // When fruit appeared
+#define FRUIT_DURATION 10000       // Fruit visible for 10 seconds
+
+// Fruit points by type
+const int fruitPoints[] = {100, 300, 500, 700, 1000};
+// Fruit colors
+const uint16_t fruitColors[] = {TFT_RED, TFT_MAGENTA, 0xFD20, TFT_RED, TFT_GREEN};
+
+// ==================== PLAYER ====================
+int playerX = 14, playerY = 15;
+int playerDir = 0;                 // 0=right, 1=down, 2=left, 3=up
+int nextDir = -1;                  // Queued direction
+unsigned long lastPlayerMove = 0;
+
+// Speed calculated from settings
+int getPlayerSpeed() {
+    return settings.playerSpeed;
+}
+
+// ==================== GHOSTS ====================
+#define NUM_GHOSTS     4
+int ghostX[NUM_GHOSTS], ghostY[NUM_GHOSTS];
+int ghostDir[NUM_GHOSTS];
+int ghostState[NUM_GHOSTS];        // 0=normal, 1=scared, 2=dead
+
+// Ghost AI types: 0=Blinky(chase), 1=Pinky(ambush), 2=Inky(random), 3=Clyde(shy)
+// Ghost colors: Red, Pink, Cyan, Orange
+const uint16_t ghostColors[] = {TFT_RED, TFT_MAGENTA, TFT_CYAN, 0xFD20};
+unsigned long lastGhostMove[NUM_GHOSTS] = {0, 0, 0, 0};  // Individual timers
+
+// Ghost speed based on difficulty
+int getGhostSpeed() {
+    switch(settings.difficulty) {
+        case 1: return 250;   // Easy - slow ghosts
+        case 2: return 180;   // Normal
+        case 3: return 120;   // Hard - fast ghosts
+        default: return 180;
+    }
+}
+
+int getGhostScaredSpeed() {
+    return getGhostSpeed() + 100;  // Always slower when scared
+}
+
+// ==================== ANIMATION ====================
+int animFrame = 0;
+unsigned long lastAnim = 0;
+
+// ==================== MAP DATA ====================
+int worldMap[MAP_W][MAP_H];
+
+// ==================== MISC ====================
+char uiBuffer[32];
+unsigned long lastTouch = 0;
+
+// ==================== EDITOR ====================
+int edCursorX = 0, edCursorY = 0;
+int edBrush = 1;
+bool edModified = false;
+
+// Direction vectors: right, down, left, up
+const int dirX[] = {1, 0, -1, 0};
+const int dirY[] = {0, 1, 0, -1};
+
+// ==================== SOUND ====================
+
+void setupBuzzer() {
+    ledcSetup(BUZZER_CHANNEL, 2000, 8);  // 8-bit resolution (0-255)
+    ledcAttachPin(BUZZER_PIN, BUZZER_CHANNEL);
+}
+
+// Calculate duty cycle based on volume (0-100%)
+int getVolumeDuty() {
+    // Map 0-100% to 0-127 (half of 255, square wave)
+    return map(settings.soundVolume, 0, 100, 0, 127);
+}
+
+void playTone(int freq, int dur) {
+    if (!settings.soundEnabled || settings.soundVolume == 0) return;
+    ledcWriteTone(BUZZER_CHANNEL, freq);
+    ledcWrite(BUZZER_CHANNEL, getVolumeDuty());
+    delay(dur);
+    ledcWrite(BUZZER_CHANNEL, 0);
+}
+
+void playToneAsync(int freq) {
+    if (!settings.soundEnabled || settings.soundVolume == 0) {
+        ledcWrite(BUZZER_CHANNEL, 0);
+        return;
+    }
+    ledcWriteTone(BUZZER_CHANNEL, freq);
+    ledcWrite(BUZZER_CHANNEL, getVolumeDuty());
+}
+
+void playWaka() {
+    if (!settings.soundEnabled || settings.soundVolume == 0) return;
+    static bool toggle = false;
+    ledcWriteTone(BUZZER_CHANNEL, toggle ? 440 : 480);
+    ledcWrite(BUZZER_CHANNEL, getVolumeDuty());
+    toggle = !toggle;
+}
+
+void stopSound() {
+    ledcWrite(BUZZER_CHANNEL, 0);
+}
+
+// ==================== HELPERS ====================
+
+bool isWall(int x, int y) {
+    if (x < 0 || x >= MAP_W || y < 0 || y >= MAP_H) return true;
+    return worldMap[x][y] == 1;
+}
+
+bool canMove(int x, int y) {
+    return !isWall(x, y);
+}
+
+uint16_t getCellColor(int cell) {
+    switch(cell) {
+        case 1: return 0x0010;   // Wall - dark blue
+        default: return TFT_BLACK;
+    }
+}
+
+// ==================== DRAWING ====================
+
+void drawCell(int x, int y) {
+    int sx = MAP_OFFSET_X + x * CELL_SIZE;
+    int sy = MAP_OFFSET_Y + y * CELL_SIZE;
+    int cell = worldMap[x][y];
+    
+    // Background
+    tft.fillRect(sx, sy, CELL_SIZE, CELL_SIZE, getCellColor(cell));
+    
+    // Wall
+    if (cell == 1) {
+        tft.drawRect(sx + 1, sy + 1, CELL_SIZE - 2, CELL_SIZE - 2, 0x001F);
+    }
+    // Dot
+    else if (cell == 5) {
+        tft.fillCircle(sx + CELL_SIZE/2, sy + CELL_SIZE/2, 2, TFT_WHITE);
+    }
+    // Power pellet
+    else if (cell == 6) {
+        int r = 3 + (animFrame % 2);
+        tft.fillCircle(sx + CELL_SIZE/2, sy + CELL_SIZE/2, r, TFT_YELLOW);
+    }
+    // Fruit (different types based on level)
+    else if (cell == 8) {
+        int fType = (currentLevel - 1) % 5;
+        uint16_t fColor = fruitColors[fType];
+        int cx = sx + CELL_SIZE/2;
+        int cy = sy + CELL_SIZE/2;
+        
+        switch (fType) {
+            case 0:  // Cherry (red)
+                tft.fillCircle(cx - 2, cy + 1, 3, TFT_RED);
+                tft.fillCircle(cx + 2, cy + 1, 3, TFT_RED);
+                tft.drawLine(cx - 1, cy - 2, cx + 1, cy - 4, TFT_GREEN);
+                tft.drawLine(cx + 1, cy - 2, cx + 1, cy - 4, TFT_GREEN);
+                break;
+            case 1:  // Strawberry (pink)
+                tft.fillCircle(cx, cy, 4, TFT_MAGENTA);
+                tft.fillCircle(cx, cy - 2, 2, TFT_GREEN);
+                tft.drawPixel(cx - 1, cy + 1, TFT_YELLOW);
+                tft.drawPixel(cx + 1, cy, TFT_YELLOW);
+                break;
+            case 2:  // Orange
+                tft.fillCircle(cx, cy, 4, 0xFD20);
+                tft.fillRect(cx - 1, cy - 5, 2, 2, TFT_GREEN);
+                break;
+            case 3:  // Apple (red)
+                tft.fillCircle(cx, cy, 4, TFT_RED);
+                tft.fillRect(cx - 1, cy - 5, 2, 3, 0x4A00);
+                tft.fillCircle(cx + 2, cy - 2, 1, TFT_WHITE);
+                break;
+            case 4:  // Melon (green)
+                tft.fillCircle(cx, cy, 4, TFT_GREEN);
+                tft.drawLine(cx - 3, cy - 2, cx + 3, cy + 2, TFT_DARKGREEN);
+                tft.drawLine(cx - 3, cy + 2, cx + 3, cy - 2, TFT_DARKGREEN);
+                break;
+        }
+    }
+}
+
+void drawMap() {
+    for (int y = 0; y < MAP_H; y++) {
+        for (int x = 0; x < MAP_W; x++) {
+            drawCell(x, y);
+        }
+    }
+}
+
+void drawPlayer() {
+    int sx = MAP_OFFSET_X + playerX * CELL_SIZE;
+    int sy = MAP_OFFSET_Y + playerY * CELL_SIZE;
+    int cx = sx + CELL_SIZE / 2;
+    int cy = sy + CELL_SIZE / 2;
+    int r = CELL_SIZE / 2 - 1;
+    
+    // Munch Man body
+    tft.fillCircle(cx, cy, r, TFT_YELLOW);
+    
+    // Mouth animation
+    int mouthOpen = (animFrame % 2) ? 4 : 1;
+    
+    if (mouthOpen > 1) {
+        switch(playerDir) {
+            case 0: // Right
+                tft.fillTriangle(cx, cy, cx + r, cy - mouthOpen, cx + r, cy + mouthOpen, TFT_BLACK);
+                break;
+            case 1: // Down
+                tft.fillTriangle(cx, cy, cx - mouthOpen, cy + r, cx + mouthOpen, cy + r, TFT_BLACK);
+                break;
+            case 2: // Left
+                tft.fillTriangle(cx, cy, cx - r, cy - mouthOpen, cx - r, cy + mouthOpen, TFT_BLACK);
+                break;
+            case 3: // Up
+                tft.fillTriangle(cx, cy, cx - mouthOpen, cy - r, cx + mouthOpen, cy - r, TFT_BLACK);
+                break;
+        }
+    }
+}
+
+void drawGhost(int i) {
+    if (ghostState[i] == 2) return;  // Dead - don't draw
+    
+    int sx = MAP_OFFSET_X + ghostX[i] * CELL_SIZE;
+    int sy = MAP_OFFSET_Y + ghostY[i] * CELL_SIZE;
+    int cx = sx + CELL_SIZE / 2;
+    int cy = sy + CELL_SIZE / 2;
+    
+    uint16_t color;
+    bool blinking = false;
+    
+    if (isPowerMode && ghostState[i] == 1) {
+        unsigned long remaining = powerModeEnd - millis();
+        
+        // Blink faster as time runs out
+        if (remaining < 3000) {
+            // Last 3 seconds - fast blink (white/blue)
+            blinking = (millis() / 150) % 2;
+            color = blinking ? TFT_WHITE : 0x001F;
+        } else if (remaining < 5000) {
+            // 3-5 seconds left - slow blink
+            blinking = (millis() / 300) % 2;
+            color = blinking ? 0x39FF : 0x001F;  // Light blue / dark blue
+        } else {
+            // Normal scared - solid blue
+            color = 0x001F;
+        }
+    } else {
+        color = ghostColors[i];
+    }
+    
+    // Ghost body (semicircle + waves)
+    tft.fillCircle(cx, cy - 1, 4, color);
+    tft.fillRect(sx + 1, cy - 1, CELL_SIZE - 2, 5, color);
+    
+    // Bottom waves
+    for (int w = 0; w < 3; w++) {
+        int wx = sx + 1 + w * 3;
+        tft.fillCircle(wx + 1, sy + CELL_SIZE - 2, 1, color);
+    }
+    
+    // Eyes
+    if (!isPowerMode || ghostState[i] != 1) {
+        tft.fillCircle(cx - 2, cy - 2, 1, TFT_WHITE);
+        tft.fillCircle(cx + 2, cy - 2, 1, TFT_WHITE);
+        tft.fillRect(cx - 2 + dirX[ghostDir[i]], cy - 2, 1, 1, TFT_BLACK);
+        tft.fillRect(cx + 2 + dirX[ghostDir[i]], cy - 2, 1, 1, TFT_BLACK);
+    } else {
+        // Scared eyes (X pattern when blinking white)
+        if (blinking) {
+            tft.drawPixel(cx - 2, cy - 3, TFT_BLUE);
+            tft.drawPixel(cx - 2, cy - 1, TFT_BLUE);
+            tft.drawPixel(cx + 2, cy - 3, TFT_BLUE);
+            tft.drawPixel(cx + 2, cy - 1, TFT_BLUE);
+        } else {
+            tft.drawPixel(cx - 2, cy - 2, TFT_WHITE);
+            tft.drawPixel(cx + 2, cy - 2, TFT_WHITE);
+        }
+    }
+}
+
+void drawGhosts() {
+    for (int i = 0; i < NUM_GHOSTS; i++) {
+        drawGhost(i);
+    }
+}
+
+// Full UI draw (called once at game start)
+void drawUIFull() {
+    // UI background
+    tft.fillRect(0, 0, SCREEN_W, UI_HEIGHT, TFT_BLACK);
+    
+    // MENU button (left side)
+    tft.fillRect(2, 3, 32, 20, 0x4208);
+    tft.drawRect(2, 3, 32, 20, TFT_DARKGREY);
+    tft.setTextColor(TFT_WHITE);
+    tft.drawCentreString("=", 18, 6, 2);
+    
+    // Score label
+    tft.setTextColor(TFT_YELLOW);
+    tft.drawString("SCORE", 42, 2, 1);
+    
+    // Level label
+    tft.setTextColor(TFT_GREEN);
+    tft.drawString("LV", 195, 2, 1);
+    
+    // Line under UI
+    tft.drawFastHLine(0, UI_HEIGHT - 1, SCREEN_W, 0x001F);
+    
+    // Force first update
+    prevScore = -1;
+    prevLives = -1;
+    prevLevel = -1;
+    prevPowerMode = !isPowerMode;
+    prevPowerSec = 999;
+}
+
+// Partial UI update (only changed elements)
+void drawUI() {
+    // Check score change
+    if (score != prevScore) {
+        tft.fillRect(42, 12, 70, 14, TFT_BLACK);  // Clear score area
+        sprintf(uiBuffer, "%d", score);
+        tft.setTextColor(TFT_WHITE);
+        tft.drawString(uiBuffer, 42, 12, 2);
+        prevScore = score;
+    }
+    
+    // Check lives change
+    if (lives != prevLives) {
+        tft.fillRect(120, 5, 55, 18, TFT_BLACK);  // Clear lives area
+        for (int i = 0; i < lives; i++) {
+            tft.fillCircle(125 + i * 14, 13, 5, TFT_YELLOW);
+            tft.fillTriangle(125 + i * 14, 13, 130 + i * 14, 10, 130 + i * 14, 16, TFT_BLACK);
+        }
+        prevLives = lives;
+    }
+    
+    // Check level change
+    if (currentLevel != prevLevel) {
+        tft.fillRect(195, 10, 25, 14, TFT_BLACK);  // Clear level area
+        sprintf(uiBuffer, "%d", currentLevel);
+        tft.setTextColor(TFT_GREEN);
+        tft.drawString(uiBuffer, 195, 12, 2);
+        prevLevel = currentLevel;
+    }
+    
+    // Check power mode change
+    unsigned long currentPowerSec = isPowerMode ? (powerModeEnd - millis()) / 1000 : 0;
+    
+    if (isPowerMode != prevPowerMode || (isPowerMode && currentPowerSec != prevPowerSec)) {
+        tft.fillRect(225, 3, 95, 18, TFT_BLACK);  // Clear power/diff area
+        
+        if (isPowerMode) {
+            tft.setTextColor(TFT_CYAN);
+            sprintf(uiBuffer, "PWR %ds", currentPowerSec);
+            tft.drawString(uiBuffer, 230, 7, 2);
+        } else {
+            const char* diffNames[] = {"", "E", "N", "H"};
+            tft.setTextColor(TFT_DARKGREY);
+            tft.drawString(diffNames[settings.difficulty], 305, 7, 2);
+        }
+        
+        prevPowerMode = isPowerMode;
+        prevPowerSec = currentPowerSec;
+    }
+}
+
+// ==================== GAME LOGIC ====================
+
+void initGhosts() {
+    // Ghost start positions (center - "house")
+    int startX = MAP_W / 2;
+    int startY = MAP_H / 2 - 2;
+    
+    for (int i = 0; i < NUM_GHOSTS; i++) {
+        ghostX[i] = startX - 1 + (i % 2) * 2;
+        ghostY[i] = startY + (i / 2);
+        ghostDir[i] = 3;  // Up
+        ghostState[i] = 0;
+    }
+}
+
+void resetPositions() {
+    // Find player start (9) or use default
+    playerX = MAP_W / 2;
+    playerY = MAP_H - 3;
+    playerDir = 2;  // Left
+    nextDir = -1;
+    
+    for (int y = 0; y < MAP_H; y++) {
+        for (int x = 0; x < MAP_W; x++) {
+            if (worldMap[x][y] == 9) {
+                playerX = x;
+                playerY = y;
+                worldMap[x][y] = 0;  // Remove marker
+            }
+        }
+    }
+    
+    initGhosts();
+    isPowerMode = false;
+}
+
+void movePlayer() {
+    if (millis() - lastPlayerMove < getPlayerSpeed()) return;
+    lastPlayerMove = millis();
+    
+    // Try to change direction
+    if (nextDir >= 0) {
+        int nx = playerX + dirX[nextDir];
+        int ny = playerY + dirY[nextDir];
+        if (canMove(nx, ny)) {
+            playerDir = nextDir;
+            nextDir = -1;
+        }
+    }
+    
+    // Move in current direction
+    int nx = playerX + dirX[playerDir];
+    int ny = playerY + dirY[playerDir];
+    
+    // Tunnel (wrap around)
+    if (nx < 0) nx = MAP_W - 1;
+    if (nx >= MAP_W) nx = 0;
+    
+    if (canMove(nx, ny)) {
+        // Clear old position
+        drawCell(playerX, playerY);
+        
+        playerX = nx;
+        playerY = ny;
+        
+        // Collect items
+        int cell = worldMap[playerX][playerY];
+        if (cell == 5) {  // Dot
+            worldMap[playerX][playerY] = 0;
+            score += 1;
+            dotsEaten++;
+            playWaka();
+        }
+        else if (cell == 6) {  // Power pellet
+            worldMap[playerX][playerY] = 0;
+            score += 10;
+            dotsEaten++;
+            isPowerMode = true;
+            powerModeEnd = millis() + 8000;  // 8 seconds
+            playTone(1000, 50);
+            
+            // Scare ghosts
+            for (int i = 0; i < NUM_GHOSTS; i++) {
+                if (ghostState[i] == 0) ghostState[i] = 1;
+            }
+        }
+        else if (cell == 8) {  // Fruit
+            worldMap[playerX][playerY] = 0;
+            fruitActive = false;
+            // Fruit type depends on level (0-4, cycles)
+            int fType = (currentLevel - 1) % 5;
+            int pts = fruitPoints[fType];
+            score += pts;
+            
+            // Show points popup briefly
+            int px = MAP_OFFSET_X + playerX * CELL_SIZE;
+            int py = MAP_OFFSET_Y + playerY * CELL_SIZE - 8;
+            tft.setTextColor(TFT_WHITE);
+            sprintf(uiBuffer, "%d", pts);
+            tft.drawCentreString(uiBuffer, px + 6, py, 1);
+            
+            playTone(1500, 50);
+            playTone(2000, 50);
+        }
+        
+        // Spawn fruit at certain dot counts (like original Munch Man)
+        if (!fruitActive && (dotsEaten == totalDots / 3 || dotsEaten == totalDots * 2 / 3)) {
+            spawnFruit();
+        }
+        
+        // Check win
+        if (dotsEaten >= totalDots) {
+            gameWon = true;
+        }
+    }
+    
+    stopSound();
+}
+
+// Ghost AI targeting based on ghost type
+void getGhostTarget(int ghostId, int &targetX, int &targetY) {
+    // Ghost AI types:
+    // 0 = Blinky (red) - directly chases player
+    // 1 = Pinky (pink) - targets 4 tiles ahead of player
+    // 2 = Inky (cyan) - unpredictable/random
+    // 3 = Clyde (orange) - chases when far, flees when close
+    
+    switch (ghostId) {
+        case 0:  // Blinky - direct chase
+            targetX = playerX;
+            targetY = playerY;
+            break;
+            
+        case 1:  // Pinky - ambush (4 tiles ahead)
+            targetX = playerX + dirX[playerDir] * 4;
+            targetY = playerY + dirY[playerDir] * 4;
+            // Clamp to map bounds
+            targetX = constrain(targetX, 0, MAP_W - 1);
+            targetY = constrain(targetY, 0, MAP_H - 1);
+            break;
+            
+        case 2:  // Inky - random target
+            if (random(3) == 0) {
+                // Sometimes chase player
+                targetX = playerX;
+                targetY = playerY;
+            } else {
+                // Random position
+                targetX = random(MAP_W);
+                targetY = random(MAP_H);
+            }
+            break;
+            
+        case 3:  // Clyde - shy (chase when far, flee when close)
+            {
+                int dist = abs(ghostX[3] - playerX) + abs(ghostY[3] - playerY);
+                if (dist > 8) {
+                    // Far away - chase
+                    targetX = playerX;
+                    targetY = playerY;
+                } else {
+                    // Close - go to corner
+                    targetX = 1;
+                    targetY = MAP_H - 2;
+                }
+            }
+            break;
+    }
+}
+
+void moveGhosts() {
+    // Level speed bonus (5% faster per level)
+    int levelBonus = (currentLevel - 1) * 5;
+    int baseSpeed = isPowerMode ? getGhostScaredSpeed() : getGhostSpeed();
+    unsigned long spd = max(60, baseSpeed - (baseSpeed * levelBonus / 100));
+    
+    for (int i = 0; i < NUM_GHOSTS; i++) {
+        // Individual ghost timers for varied movement
+        if (millis() - lastGhostMove[i] < spd + i * 10) continue;
+        lastGhostMove[i] = millis();
+        
+        if (ghostState[i] == 2) continue;  // Dead
+        
+        // Clear old position
+        drawCell(ghostX[i], ghostY[i]);
+        
+        int targetX, targetY;
+        
+        if (isPowerMode && ghostState[i] == 1) {
+            // Scared - run away from player
+            targetX = ghostX[i] + (ghostX[i] - playerX);
+            targetY = ghostY[i] + (ghostY[i] - playerY);
+        } else {
+            // Normal - use AI targeting
+            getGhostTarget(i, targetX, targetY);
+        }
+        
+        // Find best direction toward target
+        int bestDir = ghostDir[i];
+        int bestDist = 9999;
+        int validDirs[4];
+        int numValid = 0;
+        
+        for (int d = 0; d < 4; d++) {
+            // Don't reverse (unless only option)
+            if (d == (ghostDir[i] + 2) % 4) continue;
+            
+            int nx = ghostX[i] + dirX[d];
+            int ny = ghostY[i] + dirY[d];
+            
+            if (!canMove(nx, ny)) continue;
+            
+            validDirs[numValid++] = d;
+            int dist = abs(nx - targetX) + abs(ny - targetY);
+            
+            if (dist < bestDist) {
+                bestDist = dist;
+                bestDir = d;
+            }
+        }
+        
+        // Inky (ghost 2) sometimes picks random valid direction
+        if (i == 2 && numValid > 1 && random(4) == 0) {
+            bestDir = validDirs[random(numValid)];
+        }
+        
+        // If no option, allow reverse
+        int nx = ghostX[i] + dirX[bestDir];
+        int ny = ghostY[i] + dirY[bestDir];
+        if (!canMove(nx, ny)) {
+            bestDir = (ghostDir[i] + 2) % 4;
+            nx = ghostX[i] + dirX[bestDir];
+            ny = ghostY[i] + dirY[bestDir];
+        }
+        
+        if (canMove(nx, ny)) {
+            ghostX[i] = nx;
+            ghostY[i] = ny;
+            ghostDir[i] = bestDir;
+        }
+    }
+}
+
+void checkCollisions() {
+    for (int i = 0; i < NUM_GHOSTS; i++) {
+        if (ghostState[i] == 2) continue;
+        
+        if (ghostX[i] == playerX && ghostY[i] == playerY) {
+            if (isPowerMode) {
+                // Eat ghost!
+                ghostState[i] = 2;
+                score += 100;
+                playTone(2000, 100);
+                
+                // Respawn in house
+                ghostX[i] = MAP_W / 2;
+                ghostY[i] = MAP_H / 2;
+                ghostState[i] = 0;
+            } else {
+                // Player dies
+                lives--;
+                playTone(200, 500);
+                
+                if (lives <= 0) {
+                    gameOver = true;
+                } else {
+                    delay(1000);
+                    resetPositions();
+                    drawMap();
+                }
+            }
+        }
+    }
+}
+
+// Spawn fruit at center of map
+void spawnFruit() {
+    // Find center area to spawn fruit
+    int cx = MAP_W / 2;
+    int cy = MAP_H / 2 + 2;  // Below ghost house
+    
+    // Find empty cell near center
+    for (int r = 0; r < 5; r++) {
+        for (int dx = -r; dx <= r; dx++) {
+            for (int dy = -r; dy <= r; dy++) {
+                int x = cx + dx;
+                int y = cy + dy;
+                if (x > 0 && x < MAP_W - 1 && y > 0 && y < MAP_H - 1) {
+                    if (worldMap[x][y] == 0) {  // Empty cell
+                        worldMap[x][y] = 8;  // Place fruit
+                        fruitX = x;
+                        fruitY = y;
+                        fruitActive = true;
+                        fruitSpawnTime = millis();
+                        fruitType = (currentLevel - 1) % 5;
+                        
+                        // Draw fruit
+                        drawCell(x, y);
+                        
+                        // Sound
+                        playTone(1200, 30);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Remove fruit after timeout
+void updateFruit() {
+    if (fruitActive && millis() - fruitSpawnTime > FRUIT_DURATION) {
+        worldMap[fruitX][fruitY] = 0;
+        fruitActive = false;
+        drawCell(fruitX, fruitY);
+    }
+}
+
+void updatePowerMode() {
+    if (isPowerMode && millis() > powerModeEnd) {
+        isPowerMode = false;
+        for (int i = 0; i < NUM_GHOSTS; i++) {
+            ghostState[i] = 0;
+        }
+    }
+}
+
+// ==================== CONTROLS ====================
+
+void handleGameTouch() {
+    uint16_t tx, ty;
+    if (!tft.getTouch(&tx, &ty)) return;
+    
+    // MENU button check (top left corner)
+    if (ty < UI_HEIGHT && tx < 40) {
+        if (millis() - lastTouch < 300) return;
+        lastTouch = millis();
+        
+        playTone(500, 50);
+        currentMode = MODE_MENU;
+        showMainMenu();
+        return;
+    }
+    
+    // Center of screen
+    int cx = SCREEN_W / 2;
+    int cy = SCREEN_H / 2 + 20;  // Offset for UI bar
+    
+    int dx = tx - cx;
+    int dy = ty - cy;
+    
+    // Dead zone based on sensitivity (higher = smaller dead zone = more sensitive)
+    int deadZone = 50 - (settings.touchSensitivity * 15);  // 35, 20, 5
+    
+    // Only register if outside dead zone
+    if (abs(dx) < deadZone && abs(dy) < deadZone) return;
+    
+    // Determine direction
+    if (abs(dx) > abs(dy)) {
+        nextDir = (dx > 0) ? 0 : 2;  // Right or left
+    } else {
+        nextDir = (dy > 0) ? 1 : 3;  // Down or up
+    }
+}
+
+// ==================== SCREENS ====================
+
+void showMainMenu() {
+    tft.fillScreen(TFT_BLACK);
+    
+    // Title
+    tft.setTextColor(TFT_YELLOW);
+    tft.drawCentreString("MUNCH MAN", SCREEN_W / 2, 15, 4);
+    tft.setTextColor(TFT_WHITE);
+    tft.drawCentreString("CYD Edition v1.1", SCREEN_W / 2, 45, 2);
+    
+    // Munch Man graphic
+    tft.fillCircle(SCREEN_W/2, 80, 15, TFT_YELLOW);
+    tft.fillTriangle(SCREEN_W/2, 80, SCREEN_W/2 + 15, 70, SCREEN_W/2 + 15, 90, TFT_BLACK);
+    
+    // Ghosts
+    for (int i = 0; i < 4; i++) {
+        int gx = 100 + i * 35;
+        tft.fillCircle(gx, 115, 10, ghostColors[i]);
+        tft.fillRect(gx - 10, 115, 20, 10, ghostColors[i]);
+        tft.fillCircle(gx - 4, 113, 2, TFT_WHITE);
+        tft.fillCircle(gx + 4, 113, 2, TFT_WHITE);
+    }
+    
+    // PLAY button
+    tft.fillRoundRect(15, 145, 90, 40, 6, TFT_DARKGREEN);
+    tft.drawRoundRect(15, 145, 90, 40, 6, TFT_GREEN);
+    tft.setTextColor(TFT_WHITE);
+    tft.drawCentreString("PLAY", 60, 157, 2);
+    
+    // EDITOR button
+    tft.fillRoundRect(115, 145, 90, 40, 6, 0x000A);
+    tft.drawRoundRect(115, 145, 90, 40, 6, TFT_BLUE);
+    tft.drawCentreString("EDITOR", 160, 157, 2);
+    
+    // SETUP button
+    tft.fillRoundRect(215, 145, 90, 40, 6, 0x4208);
+    tft.drawRoundRect(215, 145, 90, 40, 6, TFT_LIGHTGREY);
+    tft.drawCentreString("SETUP", 260, 157, 2);
+    
+    // Current settings info
+    tft.setTextColor(TFT_DARKGREY);
+    const char* diffNames[] = {"", "Easy", "Normal", "Hard"};
+    sprintf(uiBuffer, "Difficulty: %s  Sound: %s", diffNames[settings.difficulty], settings.soundEnabled ? "ON" : "OFF");
+    tft.drawCentreString(uiBuffer, SCREEN_W/2, 195, 1);
+    
+    // Instructions
+    tft.drawCentreString("Touch screen to control direction", SCREEN_W/2, 215, 1);
+    tft.drawCentreString("Collect all dots to win!", SCREEN_W/2, 227, 1);
+}
+
+void showGameOver() {
+    tft.fillScreen(TFT_BLACK);
+    
+    tft.setTextColor(TFT_RED);
+    tft.drawCentreString("GAME OVER", SCREEN_W/2, 60, 4);
+    
+    tft.setTextColor(TFT_WHITE);
+    sprintf(uiBuffer, "SCORE: %d", score);
+    tft.drawCentreString(uiBuffer, SCREEN_W/2, 110, 4);
+    
+    tft.setTextColor(TFT_YELLOW);
+    tft.drawCentreString("Touch to continue", SCREEN_W/2, 180, 2);
+    
+    playTone(300, 200);
+    delay(100);
+    playTone(200, 400);
+    
+    // Wait for touch
+    delay(1000);
+    while (true) {
+        uint16_t tx, ty;
+        if (tft.getTouch(&tx, &ty)) {
+            delay(300);
+            currentMode = MODE_MENU;
+            showMainMenu();
+            return;
+        }
+        delay(50);
+    }
+}
+
+// Check if next level exists
+bool nextLevelExists() {
+    char filename[30];
+    sprintf(filename, "/gry/munchman/level%d.txt", currentLevel + 1);
+    return SD.exists(filename);
+}
+
+// Load next level or show final win screen
+void showLevelComplete() {
+    tft.fillScreen(TFT_BLACK);
+    
+    // Level complete animation
+    for (int i = 0; i < 3; i++) {
+        tft.fillScreen(TFT_YELLOW);
+        playTone(880, 50);
+        delay(100);
+        tft.fillScreen(TFT_BLACK);
+        delay(100);
+    }
+    
+    tft.setTextColor(TFT_GREEN);
+    sprintf(uiBuffer, "LEVEL %d", currentLevel);
+    tft.drawCentreString(uiBuffer, SCREEN_W/2, 50, 4);
+    tft.drawCentreString("COMPLETE!", SCREEN_W/2, 90, 4);
+    
+    tft.setTextColor(TFT_WHITE);
+    sprintf(uiBuffer, "SCORE: %d", score);
+    tft.drawCentreString(uiBuffer, SCREEN_W/2, 140, 2);
+    
+    // Victory melody
+    playTone(523, 100);
+    playTone(659, 100);
+    playTone(784, 200);
+    
+    delay(1500);
+    
+    // Check for next level
+    if (nextLevelExists()) {
+        currentLevel++;
+        
+        tft.setTextColor(TFT_CYAN);
+        sprintf(uiBuffer, "LEVEL %d", currentLevel);
+        tft.drawCentreString(uiBuffer, SCREEN_W/2, 180, 4);
+        tft.setTextColor(TFT_YELLOW);
+        tft.drawCentreString("GET READY!", SCREEN_W/2, 210, 2);
+        
+        playTone(1047, 300);
+        delay(2000);
+        
+        // Load next level
+        char filename[20];
+        sprintf(filename, "level%d.txt", currentLevel);
+        loadMap(filename);
+        
+        // Reset for new level but keep score and lives
+        dotsEaten = 0;
+        ghostsEaten = 0;
+        fruitActive = false;
+        gameWon = false;
+        isPowerMode = false;
+        
+        // Increase difficulty slightly
+        // (ghosts get 10% faster each level)
+        
+        resetPositions();
+        tft.fillScreen(TFT_BLACK);
+        drawUIFull();
+        drawMap();
+        drawPlayer();
+        drawGhosts();
+    } else {
+        // Final win - no more levels
+        showFinalWin();
+    }
+}
+
+void showFinalWin() {
+    tft.fillScreen(TFT_BLACK);
+    
+    // Big celebration
+    for (int i = 0; i < 5; i++) {
+        tft.fillScreen(TFT_YELLOW);
+        playTone(1047 + i * 100, 50);
+        delay(100);
+        tft.fillScreen(TFT_GREEN);
+        delay(100);
+    }
+    tft.fillScreen(TFT_BLACK);
+    
+    tft.setTextColor(TFT_YELLOW);
+    tft.drawCentreString("CONGRATULATIONS!", SCREEN_W/2, 30, 2);
+    
+    tft.setTextColor(TFT_GREEN);
+    tft.drawCentreString("ALL LEVELS", SCREEN_W/2, 70, 4);
+    tft.drawCentreString("COMPLETE!", SCREEN_W/2, 105, 4);
+    
+    tft.setTextColor(TFT_WHITE);
+    sprintf(uiBuffer, "FINAL SCORE: %d", score);
+    tft.drawCentreString(uiBuffer, SCREEN_W/2, 150, 2);
+    
+    sprintf(uiBuffer, "LEVELS: %d", currentLevel);
+    tft.drawCentreString(uiBuffer, SCREEN_W/2, 175, 2);
+    
+    tft.setTextColor(TFT_CYAN);
+    tft.drawCentreString("Touch to continue", SCREEN_W/2, 210, 2);
+    
+    // Victory fanfare
+    playTone(523, 150);
+    playTone(659, 150);
+    playTone(784, 150);
+    playTone(1047, 400);
+    
+    delay(500);
+    while (true) {
+        uint16_t tx, ty;
+        if (tft.getTouch(&tx, &ty)) {
+            delay(300);
+            currentMode = MODE_MENU;
+            showMainMenu();
+            return;
+        }
+        delay(50);
+    }
+}
+
+void showWin() {
+    showLevelComplete();
+}
+
+// ==================== MENU HANDLING ====================
+
+void handleMenuTouch() {
+    uint16_t tx, ty;
+    if (!tft.getTouch(&tx, &ty)) return;
+    
+    if (millis() - lastTouch < 300) return;
+    lastTouch = millis();
+    
+    // Buttons are at y: 145-185
+    if (ty >= 145 && ty <= 185) {
+        // PLAY button (x: 15-105)
+        if (tx >= 15 && tx <= 105) {
+            playTone(1000, 50);
+            currentMode = MODE_GAME;
+            startGame();
+        }
+        // EDITOR button (x: 115-205)
+        else if (tx >= 115 && tx <= 205) {
+            playTone(800, 50);
+            currentMode = MODE_EDITOR;
+            startEditor();
+        }
+        // SETUP button (x: 215-305)
+        else if (tx >= 215 && tx <= 305) {
+            playTone(600, 50);
+            currentMode = MODE_SETUP;
+            showSetupScreen();
+        }
+    }
+}
+
+// ==================== SETUP SCREEN ====================
+
+void saveSettings() {
+    // Remove old file first
+    if (SD.exists(CONFIG_FILE)) {
+        SD.remove(CONFIG_FILE);
+    }
+    
+    File file = SD.open(CONFIG_FILE, FILE_WRITE);
+    if (file) {
+        file.printf("%d,%d,%d,%d,%d\n", 
+            settings.soundEnabled ? 1 : 0,
+            settings.soundVolume,
+            settings.touchSensitivity,
+            settings.difficulty,
+            settings.playerSpeed);
+        file.close();
+        Serial.println("Settings saved");
+    } else {
+        Serial.println("Failed to save settings");
+    }
+}
+
+void loadSettings() {
+    if (!SD.exists(CONFIG_FILE)) {
+        Serial.println("No config file, using defaults");
+        return;
+    }
+    
+    File file = SD.open(CONFIG_FILE);
+    if (file) {
+        String line = file.readStringUntil('\n');
+        file.close();
+        
+        Serial.print("Config loaded: ");
+        Serial.println(line);
+        
+        int values[5];
+        int idx = 0;
+        int start = 0;
+        
+        for (int i = 0; i <= line.length() && idx < 5; i++) {
+            if (i == line.length() || line[i] == ',') {
+                values[idx++] = line.substring(start, i).toInt();
+                start = i + 1;
+            }
+        }
+        
+        if (idx >= 5) {
+            settings.soundEnabled = values[0] == 1;
+            settings.soundVolume = constrain(values[1], 0, 100);
+            settings.touchSensitivity = constrain(values[2], 1, 3);
+            settings.difficulty = constrain(values[3], 1, 3);
+            settings.playerSpeed = constrain(values[4], 60, 150);
+            Serial.println("Settings applied successfully");
+        } else if (idx >= 4) {
+            // Old format compatibility (without volume)
+            settings.soundEnabled = values[0] == 1;
+            settings.touchSensitivity = constrain(values[1], 1, 3);
+            settings.difficulty = constrain(values[2], 1, 3);
+            settings.playerSpeed = constrain(values[3], 60, 150);
+            settings.soundVolume = 70;  // Default volume
+            Serial.println("Old config format, using default volume");
+        }
+    }
+}
+
+void drawSetupOption(int y, const char* label, const char* value, bool selected) {
+    uint16_t bgColor = selected ? 0x001F : 0x2104;
+    tft.fillRect(10, y, 300, 30, bgColor);
+    tft.drawRect(10, y, 300, 30, TFT_WHITE);
+    
+    tft.setTextColor(TFT_YELLOW);
+    tft.drawString(label, 20, y + 8, 2);
+    
+    tft.setTextColor(TFT_WHITE);
+    tft.drawRightString(value, 300, y + 8, 2);
+    
+    // Arrows
+    tft.setTextColor(TFT_GREEN);
+    tft.drawString("<", 220, y + 8, 2);
+    tft.drawString(">", 285, y + 8, 2);
+}
+
+void showSetupScreen() {
+    tft.fillScreen(TFT_BLACK);
+    
+    // Title
+    tft.setTextColor(TFT_CYAN);
+    tft.drawCentreString("SETTINGS", SCREEN_W/2, 5, 4);
+    tft.drawFastHLine(20, 32, SCREEN_W - 40, TFT_DARKGREY);
+    
+    // Options
+    char buf[20];
+    
+    // Sound ON/OFF
+    drawSetupOption(38, "Sound", settings.soundEnabled ? "ON" : "OFF", false);
+    
+    // Volume (with bar visualization)
+    sprintf(buf, "%d%%", settings.soundVolume);
+    drawSetupOption(68, "Volume", buf, false);
+    // Draw volume bar
+    int barX = 145;
+    int barY = 73;
+    int barW = 60;
+    int barH = 8;
+    tft.drawRect(barX, barY, barW, barH, TFT_WHITE);
+    int fillW = (settings.soundVolume * (barW - 2)) / 100;
+    tft.fillRect(barX + 1, barY + 1, fillW, barH - 2, TFT_GREEN);
+    
+    // Touch Sensitivity
+    const char* sensNames[] = {"", "Low", "Medium", "High"};
+    drawSetupOption(98, "Touch Sens.", sensNames[settings.touchSensitivity], false);
+    
+    // Difficulty
+    const char* diffNames[] = {"", "Easy", "Normal", "Hard"};
+    drawSetupOption(128, "Difficulty", diffNames[settings.difficulty], false);
+    
+    // Player Speed
+    sprintf(buf, "%d ms", settings.playerSpeed);
+    drawSetupOption(158, "Player Speed", buf, false);
+    
+    // Back button
+    tft.fillRoundRect(110, 200, 100, 35, 6, TFT_MAROON);
+    tft.drawRoundRect(110, 200, 100, 35, 6, TFT_RED);
+    tft.setTextColor(TFT_WHITE);
+    tft.drawCentreString("BACK", SCREEN_W/2, 210, 2);
+    
+    // Help text
+    tft.setTextColor(TFT_DARKGREY);
+    tft.drawCentreString("Touch < > to change values", SCREEN_W/2, 190, 1);
+}
+
+void handleSetupTouch() {
+    uint16_t tx, ty;
+    if (!tft.getTouch(&tx, &ty)) return;
+    
+    if (millis() - lastTouch < 200) return;
+    lastTouch = millis();
+    
+    bool changed = false;
+    bool isLeft = (tx >= 210 && tx <= 250);
+    bool isRight = (tx >= 270 && tx <= 310);
+    
+    // Sound ON/OFF (y: 38-65)
+    if (ty >= 38 && ty <= 65 && (isLeft || isRight)) {
+        settings.soundEnabled = !settings.soundEnabled;
+        changed = true;
+        if (settings.soundEnabled) playTone(1000, 50);
+    }
+    // Volume (y: 68-95)
+    else if (ty >= 68 && ty <= 95) {
+        if (isLeft && settings.soundVolume > 0) {
+            settings.soundVolume -= 10;
+            changed = true;
+            showSetupScreen();  // Refresh to show new bar
+            playTone(600, 50);  // Preview at new volume
+            return;  // Skip normal sound at end
+        } else if (isRight && settings.soundVolume < 100) {
+            settings.soundVolume += 10;
+            changed = true;
+            showSetupScreen();  // Refresh to show new bar
+            playTone(600, 50);  // Preview at new volume
+            return;  // Skip normal sound at end
+        }
+    }
+    // Touch Sensitivity (y: 98-125)
+    else if (ty >= 98 && ty <= 125) {
+        if (isLeft && settings.touchSensitivity > 1) {
+            settings.touchSensitivity--;
+            changed = true;
+        } else if (isRight && settings.touchSensitivity < 3) {
+            settings.touchSensitivity++;
+            changed = true;
+        }
+    }
+    // Difficulty (y: 128-155)
+    else if (ty >= 128 && ty <= 155) {
+        if (isLeft && settings.difficulty > 1) {
+            settings.difficulty--;
+            changed = true;
+        } else if (isRight && settings.difficulty < 3) {
+            settings.difficulty++;
+            changed = true;
+        }
+    }
+    // Player Speed (y: 158-185)
+    else if (ty >= 158 && ty <= 185) {
+        if (isLeft && settings.playerSpeed < 150) {
+            settings.playerSpeed += 10;  // Slower
+            changed = true;
+        } else if (isRight && settings.playerSpeed > 60) {
+            settings.playerSpeed -= 10;  // Faster
+            changed = true;
+        }
+    }
+    // Back button (y: 200-235)
+    else if (ty >= 200 && ty <= 235 && tx >= 110 && tx <= 210) {
+        // Show saving message
+        tft.fillRect(80, 100, 160, 40, TFT_DARKGREEN);
+        tft.drawRect(80, 100, 160, 40, TFT_GREEN);
+        tft.setTextColor(TFT_WHITE);
+        tft.drawCentreString("SAVING...", SCREEN_W/2, 112, 2);
+        
+        playTone(500, 50);
+        saveSettings();
+        
+        // Show saved confirmation
+        tft.fillRect(80, 100, 160, 40, TFT_DARKGREEN);
+        tft.drawRect(80, 100, 160, 40, TFT_GREEN);
+        tft.drawCentreString("SAVED!", SCREEN_W/2, 112, 2);
+        playTone(1000, 100);
+        delay(500);
+        
+        currentMode = MODE_MENU;
+        showMainMenu();
+        return;
+    }
+    
+    if (changed) {
+        playTone(800, 30);
+        showSetupScreen();
+    }
+}
+
+// ==================== MAP MANAGEMENT ====================
+
+void createDefaultMap() {
+    // Fill with walls
+    for (int y = 0; y < MAP_H; y++) {
+        for (int x = 0; x < MAP_W; x++) {
+            worldMap[x][y] = 1;
+        }
+    }
+    
+    // Classic Munch Man layout (simplified)
+    // Main corridors
+    for (int x = 1; x < MAP_W - 1; x++) {
+        worldMap[x][1] = 5;           // Top corridor
+        worldMap[x][MAP_H-2] = 5;     // Bottom corridor
+        worldMap[x][MAP_H/2] = 5;     // Middle corridor
+    }
+    
+    for (int y = 1; y < MAP_H - 1; y++) {
+        worldMap[1][y] = 5;           // Left corridor
+        worldMap[MAP_W-2][y] = 5;     // Right corridor
+        worldMap[MAP_W/2][y] = 5;     // Center vertical
+    }
+    
+    // Additional corridors
+    for (int x = 1; x < MAP_W - 1; x++) {
+        worldMap[x][5] = 5;
+        worldMap[x][MAP_H - 6] = 5;
+    }
+    
+    for (int y = 1; y < MAP_H - 1; y++) {
+        worldMap[7][y] = 5;
+        worldMap[MAP_W - 8][y] = 5;
+    }
+    
+    // Ghost house (center)
+    int hx = MAP_W/2 - 2;
+    int hy = MAP_H/2 - 2;
+    for (int y = hy; y < hy + 4; y++) {
+        for (int x = hx; x < hx + 4; x++) {
+            worldMap[x][y] = 0;  // Empty (no dots)
+        }
+    }
+    // House walls
+    worldMap[hx][hy] = 1;
+    worldMap[hx+3][hy] = 1;
+    worldMap[hx][hy+3] = 1;
+    worldMap[hx+3][hy+3] = 1;
+    
+    // Power pellets in corners
+    worldMap[1][1] = 6;
+    worldMap[MAP_W-2][1] = 6;
+    worldMap[1][MAP_H-2] = 6;
+    worldMap[MAP_W-2][MAP_H-2] = 6;
+    
+    // Player start
+    worldMap[MAP_W/2][MAP_H - 3] = 9;
+    
+    // Count dots
+    totalDots = 0;
+    for (int y = 0; y < MAP_H; y++) {
+        for (int x = 0; x < MAP_W; x++) {
+            if (worldMap[x][y] == 5 || worldMap[x][y] == 6) {
+                totalDots++;
+            }
+        }
+    }
+}
+
+void loadMap(const char* filename) {
+    char path[64];
+    sprintf(path, "%s%s", MAP_PATH, filename);
+    
+    File file = SD.open(path);
+    if (!file) {
+        Serial.println("Cannot open map, using default");
+        createDefaultMap();
+        return;
+    }
+    
+    int x = 0, y = 0;
+    while (file.available() && y < MAP_H) {
+        char c = file.read();
+        if (c >= '0' && c <= '9') {
+            worldMap[x][y] = c - '0';
+            x++;
+            if (x >= MAP_W) {
+                x = 0;
+                y++;
+            }
+        }
+    }
+    file.close();
+    
+    // Count dots
+    totalDots = 0;
+    for (int y = 0; y < MAP_H; y++) {
+        for (int x = 0; x < MAP_W; x++) {
+            if (worldMap[x][y] == 5 || worldMap[x][y] == 6) {
+                totalDots++;
+            }
+        }
+    }
+}
+
+void saveMap(const char* filename) {
+    char path[64];
+    sprintf(path, "%s%s", MAP_PATH, filename);
+    
+    if (SD.exists(path)) SD.remove(path);
+    
+    File file = SD.open(path, FILE_WRITE);
+    if (!file) {
+        tft.fillRect(0, 0, SCREEN_W, 24, TFT_RED);
+        tft.setTextColor(TFT_WHITE);
+        tft.drawCentreString("SAVE ERROR!", SCREEN_W/2, 5, 2);
+        delay(1000);
+        return;
+    }
+    
+    for (int y = 0; y < MAP_H; y++) {
+        for (int x = 0; x < MAP_W; x++) {
+            file.print(worldMap[x][y]);
+        }
+        file.println();
+    }
+    file.close();
+    
+    tft.fillRect(0, 0, SCREEN_W, 24, TFT_DARKGREEN);
+    tft.setTextColor(TFT_WHITE);
+    tft.drawCentreString("SAVED!", SCREEN_W/2, 5, 2);
+    playTone(1500, 100);
+    delay(500);
+    edModified = false;
+}
+
+// ==================== GAME ====================
+
+void startGame() {
+    // Reset stats
+    score = 0;
+    lives = 3;
+    dotsEaten = 0;
+    ghostsEaten = 0;
+    currentLevel = 1;
+    gameOver = false;
+    gameWon = false;
+    isPowerMode = false;
+    fruitActive = false;
+    
+    // Load or create map
+    if (SD.exists("/gry/munchman/level1.txt")) {
+        loadMap("level1.txt");
+    } else {
+        createDefaultMap();
+    }
+    
+    resetPositions();
+    
+    tft.fillScreen(TFT_BLACK);
+    drawUIFull();
+    drawMap();
+    drawPlayer();
+    drawGhosts();
+}
+
+void gameLoop() {
+    if (gameOver) {
+        showGameOver();
+        return;
+    }
+    
+    if (gameWon) {
+        showWin();
+        return;
+    }
+    
+    // Animation
+    if (millis() - lastAnim > 150) {
+        lastAnim = millis();
+        animFrame++;
+    }
+    
+    // Update
+    updatePowerMode();
+    updateFruit();
+    handleGameTouch();
+    movePlayer();
+    moveGhosts();
+    checkCollisions();
+    
+    // Draw
+    drawPlayer();
+    drawGhosts();
+    drawUI();
+}
+
+// ==================== EDITOR ====================
+
+uint16_t getEditorCellColor(int cell) {
+    switch(cell) {
+        case 0: return 0x2104;      // Empty
+        case 1: return 0x001F;      // Wall
+        case 5: return TFT_WHITE;   // Dot
+        case 6: return TFT_YELLOW;  // Power pellet
+        case 7: return TFT_MAGENTA; // Ghost spawn
+        case 8: return TFT_RED;     // Fruit
+        case 9: return TFT_GREEN;   // Player start
+        default: return TFT_BLACK;
+    }
+}
+
+void drawEditorToolbar() {
+    tft.fillRect(0, 0, SCREEN_W, 24, 0x2104);
+    tft.drawFastHLine(0, 23, SCREEN_W, TFT_WHITE);
+    
+    // Current brush
+    tft.fillRect(5, 3, 18, 18, getEditorCellColor(edBrush));
+    tft.drawRect(5, 3, 18, 18, TFT_WHITE);
+    
+    char buf[4];
+    sprintf(buf, "%d", edBrush);
+    tft.setTextColor(edBrush == 0 ? TFT_WHITE : TFT_BLACK);
+    tft.drawCentreString(buf, 14, 6, 2);
+    
+    // Brush name
+    const char* names[] = {"empty", "wall", "?", "?", "?", "dot", "power", "ghost", "fruit", "start"};
+    tft.setTextColor(TFT_YELLOW);
+    tft.drawString(names[edBrush], 28, 6, 1);
+    
+    // [<] [>]
+    tft.fillRect(80, 3, 20, 18, TFT_DARKGREY);
+    tft.fillRect(103, 3, 20, 18, TFT_DARKGREY);
+    tft.setTextColor(TFT_WHITE);
+    tft.drawCentreString("<", 90, 5, 2);
+    tft.drawCentreString(">", 113, 5, 2);
+    
+    // [CLEAR]
+    tft.fillRect(130, 3, 40, 18, TFT_MAROON);
+    tft.drawCentreString("CLR", 150, 5, 2);
+    
+    // [SAVE]
+    tft.fillRect(175, 3, 40, 18, edModified ? TFT_ORANGE : TFT_DARKGREEN);
+    tft.drawCentreString("SAVE", 195, 5, 2);
+    
+    // [TEST]
+    tft.fillRect(220, 3, 40, 18, TFT_BLUE);
+    tft.drawCentreString("TEST", 240, 5, 2);
+    
+    // [EXIT]
+    tft.fillRect(265, 3, 50, 18, TFT_MAROON);
+    tft.drawCentreString("EXIT", 290, 5, 2);
+}
+
+void drawEditorMap() {
+    for (int y = 0; y < MAP_H; y++) {
+        for (int x = 0; x < MAP_W; x++) {
+            int sx = MAP_OFFSET_X + x * CELL_SIZE;
+            int sy = MAP_OFFSET_Y + y * CELL_SIZE;
+            
+            tft.fillRect(sx, sy, CELL_SIZE - 1, CELL_SIZE - 1, getEditorCellColor(worldMap[x][y]));
+            
+            // Cursor
+            if (x == edCursorX && y == edCursorY) {
+                tft.drawRect(sx, sy, CELL_SIZE - 1, CELL_SIZE - 1, TFT_WHITE);
+            }
+        }
+    }
+}
+
+void startEditor() {
+    edCursorX = 0;
+    edCursorY = 0;
+    edBrush = 1;
+    edModified = false;
+    
+    // Load map if exists, otherwise create empty
+    if (SD.exists("/gry/munchman/level1.txt")) {
+        loadMap("level1.txt");
+    } else {
+        // Empty map with border
+        for (int y = 0; y < MAP_H; y++) {
+            for (int x = 0; x < MAP_W; x++) {
+                if (x == 0 || x == MAP_W-1 || y == 0 || y == MAP_H-1) {
+                    worldMap[x][y] = 1;
+                } else {
+                    worldMap[x][y] = 0;
+                }
+            }
+        }
+    }
+    
+    tft.fillScreen(TFT_BLACK);
+    drawEditorToolbar();
+    drawEditorMap();
+}
+
+void clearMap() {
+    for (int y = 0; y < MAP_H; y++) {
+        for (int x = 0; x < MAP_W; x++) {
+            if (x == 0 || x == MAP_W-1 || y == 0 || y == MAP_H-1) {
+                worldMap[x][y] = 1;
+            } else {
+                worldMap[x][y] = 0;
+            }
+        }
+    }
+    edModified = true;
+    drawEditorMap();
+    drawEditorToolbar();
+}
+
+void handleEditorTouch() {
+    uint16_t tx, ty;
+    if (!tft.getTouch(&tx, &ty)) return;
+    
+    if (millis() - lastTouch < 100) return;
+    lastTouch = millis();
+    
+    // Toolbar
+    if (ty < 24) {
+        // [<]
+        if (tx >= 80 && tx < 100) {
+            edBrush--;
+            if (edBrush < 0) edBrush = 9;
+            if (edBrush >= 2 && edBrush <= 4) edBrush = 1;
+            playTone(500, 20);
+            drawEditorToolbar();
+        }
+        // [>]
+        else if (tx >= 103 && tx < 123) {
+            edBrush++;
+            if (edBrush > 9) edBrush = 0;
+            if (edBrush >= 2 && edBrush <= 4) edBrush = 5;
+            playTone(600, 20);
+            drawEditorToolbar();
+        }
+        // [CLEAR]
+        else if (tx >= 130 && tx < 170) {
+            playTone(300, 50);
+            clearMap();
+        }
+        // [SAVE]
+        else if (tx >= 175 && tx < 215) {
+            saveMap("level1.txt");
+            drawEditorToolbar();
+        }
+        // [TEST]
+        else if (tx >= 220 && tx < 260) {
+            playTone(1000, 50);
+            currentMode = MODE_GAME;
+            startGame();
+        }
+        // [EXIT]
+        else if (tx >= 265) {
+            playTone(400, 50);
+            currentMode = MODE_MENU;
+            showMainMenu();
+        }
+    }
+    // Map area
+    else if (ty >= MAP_OFFSET_Y) {
+        int mx = (tx - MAP_OFFSET_X) / CELL_SIZE;
+        int my = (ty - MAP_OFFSET_Y) / CELL_SIZE;
+        
+        if (mx >= 0 && mx < MAP_W && my >= 0 && my < MAP_H) {
+            // Clear old cursor
+            int oldSx = MAP_OFFSET_X + edCursorX * CELL_SIZE;
+            int oldSy = MAP_OFFSET_Y + edCursorY * CELL_SIZE;
+            tft.fillRect(oldSx, oldSy, CELL_SIZE - 1, CELL_SIZE - 1, getEditorCellColor(worldMap[edCursorX][edCursorY]));
+            
+            edCursorX = mx;
+            edCursorY = my;
+            
+            worldMap[mx][my] = edBrush;
+            edModified = true;
+            
+            // Draw new cell with cursor
+            int sx = MAP_OFFSET_X + mx * CELL_SIZE;
+            int sy = MAP_OFFSET_Y + my * CELL_SIZE;
+            tft.fillRect(sx, sy, CELL_SIZE - 1, CELL_SIZE - 1, getEditorCellColor(edBrush));
+            tft.drawRect(sx, sy, CELL_SIZE - 1, CELL_SIZE - 1, TFT_WHITE);
+            
+            playTone(800, 10);
+            drawEditorToolbar();
+        }
+    }
+}
+
+// ==================== MAIN ====================
+
+void setup() {
+    Serial.begin(115200);
+    Serial.println("CYD MUNCH MAN v1.1");
+    
+    tft.init();
+    tft.setRotation(1);
+    tft.fillScreen(TFT_BLACK);
+    
+    uint16_t calData[] = {319, 3470, 237, 3438, 1};
+    tft.setTouch(calData);
+    
+    setupBuzzer();
+    
+    // Splash screen
+    tft.setTextColor(TFT_YELLOW);
+    tft.drawCentreString("MUNCH MAN", SCREEN_W/2, 100, 4);
+    tft.setTextColor(TFT_WHITE);
+    tft.drawCentreString("Loading...", SCREEN_W/2, 140, 2);
+    
+    // Initialize SD card
+    if (SD.begin(SD_CS)) {
+        Serial.println("SD OK");
+        if (!SD.exists("/gry")) SD.mkdir("/gry");
+        if (!SD.exists("/gry/munchman")) SD.mkdir("/gry/munchman");
+        
+        // Load saved settings
+        loadSettings();
+        Serial.println("Settings loaded");
+    } else {
+        Serial.println("SD ERROR");
+    }
+    
+    delay(1000);
+    
+    currentMode = MODE_MENU;
+    showMainMenu();
+}
+
+void loop() {
+    switch (currentMode) {
+        case MODE_MENU:
+            handleMenuTouch();
+            break;
+        case MODE_GAME:
+            gameLoop();
+            break;
+        case MODE_EDITOR:
+            handleEditorTouch();
+            break;
+        case MODE_SETUP:
+            handleSetupTouch();
+            break;
+    }
+}
